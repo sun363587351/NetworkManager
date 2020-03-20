@@ -50,6 +50,9 @@ _LOG_DECLARE_SELF(NMDeviceWifi);
 
 #define SCAN_RAND_MAC_ADDRESS_EXPIRE_MIN 5
 
+#define SCAN_REQUEST_SSIDS_MAX_NUM      32u
+#define SCAN_REQUEST_SSIDS_MAX_AGE_MSEC (3 * 60 * NM_UTILS_MSEC_PER_SEC)
+
 /*****************************************************************************/
 
 NM_GOBJECT_PROPERTIES_DEFINE (NMDeviceWifi,
@@ -77,12 +80,21 @@ typedef struct {
 	CList             scanning_prohibited_lst_head;
 
 	NMWifiAP *        current_ap;
+
+	GHashTable       *scan_request_ssids_hash;
+	CList             scan_request_ssids_lst_head;
+
 	guint32           rate;
 	bool              enabled:1; /* rfkilled or not */
 	bool              requested_scan:1;
 	bool              ssid_found:1;
 	bool              is_scanning:1;
 	bool              hidden_probe_scan_warn:1;
+
+	bool              scan_requested:1;
+
+	bool              scanning_explicit_allowed:1;
+	bool              scanning_periodic_allowed:1;
 
 	gint64            last_scan_msec;
 
@@ -177,10 +189,7 @@ static void _requested_scan_set (NMDeviceWifi *self, gboolean value);
 
 static void periodic_update (NMDeviceWifi *self);
 
-static void request_wireless_scan (NMDeviceWifi *self,
-                                   gboolean periodic,
-                                   gboolean force_if_scanning,
-                                   const GPtrArray *ssids);
+static void _scanning_kick_off (NMDeviceWifi *self);
 
 static void ap_add_remove (NMDeviceWifi *self,
                            gboolean is_adding,
@@ -190,6 +199,112 @@ static void ap_add_remove (NMDeviceWifi *self,
 static void _hw_addr_set_scanning (NMDeviceWifi *self, gboolean do_reset);
 
 static void recheck_p2p_availability (NMDeviceWifi *self);
+
+static void _scanning_allowed_maybe_changed (NMDeviceWifi *self);
+
+/*****************************************************************************/
+
+typedef struct {
+	GBytes *ssid;
+	CList lst;
+	gint64 timestamp_msec;
+} ScanRequestSsidData;
+
+static void
+_scan_request_ssids_remove (NMDeviceWifiPrivate *priv,
+                            ScanRequestSsidData *srs_data)
+{
+	if (!g_hash_table_remove (priv->scan_request_ssids_hash, srs_data))
+		nm_assert_not_reached ();
+	c_list_unlink_stale (&srs_data->lst);
+	g_bytes_unref (srs_data->ssid);
+	nm_g_slice_free (srs_data);
+}
+
+static void
+_scan_request_ssids_remove_old (NMDeviceWifiPrivate *priv,
+                                gint64 now_msec)
+{
+	ScanRequestSsidData *srs_data;
+	gint64 cutoff_time_msec = now_msec - SCAN_REQUEST_SSIDS_MAX_AGE_MSEC;
+
+	while ((srs_data = c_list_last_entry (&priv->scan_request_ssids_lst_head, ScanRequestSsidData, lst))) {
+		if (srs_data->timestamp_msec < cutoff_time_msec)
+			_scan_request_ssids_remove (priv, srs_data);
+	}
+}
+
+static GPtrArray *
+_scan_request_ssids_fetch (NMDeviceWifiPrivate *priv,
+                           gint64 now_msec)
+{
+	ScanRequestSsidData *srs_data;
+	gint64 cutoff_time_msec = now_msec - SCAN_REQUEST_SSIDS_MAX_AGE_MSEC;
+	GPtrArray *ssids;
+	guint len;
+
+	while ((srs_data = c_list_last_entry (&priv->scan_request_ssids_lst_head, ScanRequestSsidData, lst))) {
+		if (srs_data->timestamp_msec < cutoff_time_msec)
+			_scan_request_ssids_remove (priv, srs_data);
+	}
+
+	len = c_list_length (&priv->scan_request_ssids_lst_head);
+	if (len == 0)
+		return NULL;
+
+	ssids = g_ptr_array_new_full (len, (GDestroyNotify) g_bytes_unref);
+	while ((srs_data = c_list_first_entry (&priv->scan_request_ssids_lst_head, ScanRequestSsidData, lst))) {
+		g_ptr_array_add (ssids, g_bytes_ref (srs_data->ssid));
+		_scan_request_ssids_remove (priv, srs_data);
+	}
+	return ssids;
+}
+
+static void
+_scan_request_ssids_track (NMDeviceWifiPrivate *priv,
+                           const GPtrArray *ssids)
+{
+	gint64 now_msec;
+	guint i;
+
+	if (   !ssids
+	    || ssids->len == 0)
+		return;
+
+	now_msec = nm_utils_get_monotonic_timestamp_msec ();
+
+	if (!priv->scan_request_ssids_hash)
+		priv->scan_request_ssids_hash = g_hash_table_new (nm_pgbytes_hash, nm_pgbytes_equal);
+
+	for (i = ssids->len; i > 0; ) {
+		ScanRequestSsidData *d;
+		GBytes *ssid = ssids->pdata[--i];
+
+		d = g_hash_table_lookup (priv->scan_request_ssids_hash, &ssid);
+		if (!d) {
+			d = g_slice_new (ScanRequestSsidData);
+			*d = (ScanRequestSsidData) {
+				.lst            = C_LIST_INIT (d->lst),
+				.timestamp_msec = now_msec,
+				.ssid           = g_bytes_ref (ssid),
+			};
+			g_hash_table_add (priv->scan_request_ssids_hash, d);
+		} else
+			d->timestamp_msec = now_msec;
+		nm_c_list_move_front (&priv->scan_request_ssids_lst_head, &d->lst);
+	}
+
+	/* Trim the excess. Since we always prepend new entries to the front of the list, it
+	 * means to remove the last ones. */
+	for (i = g_hash_table_size (priv->scan_request_ssids_hash); i > SCAN_REQUEST_SSIDS_MAX_NUM; i--) {
+		ScanRequestSsidData *d;
+
+		d = c_list_last_entry (&priv->scan_request_ssids_lst_head, ScanRequestSsidData, lst);
+		_scan_request_ssids_remove (priv, d);
+	}
+
+	_scan_request_ssids_remove_old (priv, now_msec);
+}
 
 /*****************************************************************************/
 
@@ -220,7 +335,9 @@ nm_device_wifi_scanning_prohibited_track (NMDeviceWifi *self,
 			return;
 
 		nm_c_list_elem_free (elem);
-		return;
+		if (!c_list_is_empty (&priv->scanning_prohibited_lst_head))
+			return;
+		goto handle_changed;
 	}
 
 	if (elem)
@@ -228,6 +345,11 @@ nm_device_wifi_scanning_prohibited_track (NMDeviceWifi *self,
 
 	c_list_link_tail (&priv->scanning_prohibited_lst_head,
 	                  &nm_c_list_elem_new_stale (tag)->lst);
+	if (c_list_first_entry (&priv->scanning_prohibited_lst_head, NMCListElem, lst)->data != tag)
+		return;
+
+handle_changed:
+	_scanning_allowed_maybe_changed (self);
 }
 
 /*****************************************************************************/
@@ -255,7 +377,7 @@ nm_device_wifi_get_scanning (NMDeviceWifi *self)
 	return NM_DEVICE_WIFI_GET_PRIVATE (self)->is_scanning;
 }
 
-static void
+static gboolean
 _notify_scanning (NMDeviceWifi *self)
 {
 	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
@@ -266,7 +388,7 @@ _notify_scanning (NMDeviceWifi *self)
 	           && nm_supplicant_interface_get_scanning (priv->sup_iface);
 
 	if (scanning == priv->is_scanning)
-		return;
+		return FALSE;
 
 	_LOGD (LOGD_WIFI, "wifi-scan: scanning-state: %s", scanning ? "scanning" : "idle");
 	priv->is_scanning = scanning;
@@ -277,13 +399,13 @@ _notify_scanning (NMDeviceWifi *self)
 		priv->last_scan_msec = nm_utils_get_monotonic_timestamp_msec ();
 	}
 
-	schedule_scan (self, TRUE);
-
 	nm_gobject_notify_together (self,
 	                            PROP_SCANNING,
 	                              last_scan_changed
 	                            ? PROP_LAST_SCAN
 	                            : PROP_0);
+
+	_scanning_allowed_maybe_changed (self);
 
 	if (!priv->is_scanning) {
 		_requested_scan_set (self, FALSE);
@@ -292,6 +414,8 @@ _notify_scanning (NMDeviceWifi *self)
 			periodic_update (self);
 		}
 	}
+
+	return TRUE;
 }
 
 static void
@@ -728,9 +852,12 @@ deactivate (NMDevice *device)
 		_notify (self, PROP_MODE);
 	}
 
-	/* Ensure we trigger a scan after deactivating a Hotspot */
-	if (old_mode == NM_802_11_MODE_AP)
-		request_wireless_scan (self, FALSE, FALSE, NULL);
+	if (old_mode == NM_802_11_MODE_AP) {
+		/* Ensure we trigger a scan after deactivating a Hotspot */
+		priv->scan_requested = TRUE;
+	}
+
+	_scanning_allowed_maybe_changed (self);
 }
 
 static void
@@ -1188,7 +1315,7 @@ ssids_options_to_ptrarray (GVariant *value, GError **error)
 	nm_assert (g_variant_is_of_type (value, G_VARIANT_TYPE ("aay")));
 
 	num_ssids = g_variant_n_children (value);
-	if (num_ssids > 32) {
+	if (num_ssids > SCAN_REQUEST_SSIDS_MAX_NUM) {
 		g_set_error_literal (error,
 		                     NM_DEVICE_ERROR,
 		                     NM_DEVICE_ERROR_INVALID_ARGUMENT,
@@ -1234,6 +1361,7 @@ dbus_request_scan_cb (NMDevice *device,
                       gpointer user_data)
 {
 	NMDeviceWifi *self = NM_DEVICE_WIFI (device);
+	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
 	gs_unref_ptrarray GPtrArray *ssids = user_data;
 
 	if (error) {
@@ -1241,15 +1369,9 @@ dbus_request_scan_cb (NMDevice *device,
 		return;
 	}
 
-	if (check_scanning_prohibited (self, FALSE)) {
-		g_dbus_method_invocation_return_error_literal (context,
-		                                               NM_DEVICE_ERROR,
-		                                               NM_DEVICE_ERROR_NOT_ALLOWED,
-		                                               "Scanning not allowed at this time");
-		return;
-	}
+	_scan_request_ssids_track (priv, ssids);
+	_scanning_kick_off (self, FALSE, TRUE);
 
-	request_wireless_scan (self, FALSE, FALSE, ssids);
 	g_dbus_method_invocation_return_value (context, NULL);
 }
 
@@ -1260,7 +1382,6 @@ _nm_device_wifi_request_scan (NMDeviceWifi *self,
 {
 	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
 	NMDevice *device = NM_DEVICE (self);
-	gint64 last_scan;
 	gs_unref_ptrarray GPtrArray *ssids = NULL;
 
 	if (options) {
@@ -1287,35 +1408,11 @@ _nm_device_wifi_request_scan (NMDeviceWifi *self,
 
 	if (   !priv->enabled
 	    || !priv->sup_iface
-	    || nm_device_get_state (device) < NM_DEVICE_STATE_DISCONNECTED
-	    || nm_device_is_activating (device)) {
+	    || nm_device_get_state (device) < NM_DEVICE_STATE_DISCONNECTED) {
 		g_dbus_method_invocation_return_error_literal (invocation,
 		                                               NM_DEVICE_ERROR,
 		                                               NM_DEVICE_ERROR_NOT_ALLOWED,
 		                                               "Scanning not allowed while unavailable or activating");
-		return;
-	}
-
-	if (nm_supplicant_interface_get_scanning (priv->sup_iface)) {
-		g_dbus_method_invocation_return_error_literal (invocation,
-		                                               NM_DEVICE_ERROR,
-		                                               NM_DEVICE_ERROR_NOT_ALLOWED,
-		                                               "Scanning not allowed while already scanning");
-		return;
-	}
-
-	last_scan = nm_supplicant_interface_get_last_scan (priv->sup_iface);
-	if (   last_scan > 0
-	    && nm_utils_get_monotonic_timestamp_msec () < last_scan + (10 * NM_UTILS_MSEC_PER_SEC)) {
-		/* FIXME: we really should not outright reject a scan request in this case. We should
-		 * ensure to start a scan request soon, possibly with rate limiting. And there is no
-		 * need to tell the caller that we aren't going to scan...
-		 *
-		 * Same above, if we are currently scanning... */
-		g_dbus_method_invocation_return_error_literal (invocation,
-		                                               NM_DEVICE_ERROR,
-		                                               NM_DEVICE_ERROR_NOT_ALLOWED,
-		                                               "Scanning not allowed immediately following previous scan");
 		return;
 	}
 
@@ -1329,9 +1426,10 @@ _nm_device_wifi_request_scan (NMDeviceWifi *self,
 	                       g_steal_pointer (&ssids));
 }
 
-static gboolean
-check_scanning_prohibited (NMDeviceWifi *self,
-                           gboolean periodic)
+static void
+_scanning_get_allowed (NMDeviceWifi *self,
+                       gboolean *out_scanning_explicit_allowed,
+                       gboolean *out_scanning_periodic_allowed)
 {
 	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
 	NMSupplicantInterfaceState supplicant_state;
@@ -1339,14 +1437,14 @@ check_scanning_prohibited (NMDeviceWifi *self,
 	nm_assert (NM_IS_SUPPLICANT_INTERFACE (priv->sup_iface));
 
 	if (c_list_is_empty (&priv->scanning_prohibited_lst_head))
-		return TRUE;
+		goto out_prohibited;
 
 	/* Don't scan when a an AP or Ad-Hoc connection is active as it will
 	 * disrupt connected clients or peers.
 	 */
 	if (NM_IN_SET (priv->mode, NM_802_11_MODE_ADHOC,
 	                           NM_802_11_MODE_AP))
-		return TRUE;
+		goto out_prohibited;
 
 	switch (nm_device_get_state (NM_DEVICE (self))) {
 	case NM_DEVICE_STATE_UNKNOWN:
@@ -1359,33 +1457,57 @@ check_scanning_prohibited (NMDeviceWifi *self,
 	case NM_DEVICE_STATE_IP_CHECK:
 	case NM_DEVICE_STATE_SECONDARIES:
 	case NM_DEVICE_STATE_DEACTIVATING:
-		/* Prohibit scans when unusable or activating */
-		return TRUE;
+		goto out_prohibited;
 	case NM_DEVICE_STATE_DISCONNECTED:
 	case NM_DEVICE_STATE_FAILED:
-		/* Can always scan when disconnected */
-		return FALSE;
+		goto out_allowed;
 	case NM_DEVICE_STATE_ACTIVATED:
 		/* Prohibit periodic scans when connected; we ask the supplicant to
 		 * background scan for us, unless the connection is locked to a specific
 		 * BSSID.
 		 */
-		if (periodic)
-			return TRUE;
-		break;
+		*out_scanning_periodic_allowed = FALSE;
+
+		/* Prohibit scans if the supplicant is busy */
+		supplicant_state = nm_supplicant_interface_get_state (priv->sup_iface);
+		if (   supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_ASSOCIATING
+		    || supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_ASSOCIATED
+		    || supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_4WAY_HANDSHAKE
+		    || supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_GROUP_HANDSHAKE
+		    || priv->is_scanning)
+			*out_scanning_explicit_allowed = FALSE;
+		else
+			*out_scanning_explicit_allowed = TRUE;
+		return;
 	}
 
-	/* Prohibit scans if the supplicant is busy */
-	supplicant_state = nm_supplicant_interface_get_state (priv->sup_iface);
-	if (   supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_ASSOCIATING
-	    || supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_ASSOCIATED
-	    || supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_4WAY_HANDSHAKE
-	    || supplicant_state == NM_SUPPLICANT_INTERFACE_STATE_GROUP_HANDSHAKE
-	    || nm_supplicant_interface_get_scanning (priv->sup_iface))
-		return TRUE;
+out_prohibited:
+	*out_scanning_explicit_allowed = FALSE;
+	*out_scanning_periodic_allowed = FALSE;
+	return;
 
-	/* Allow the scan */
-	return FALSE;
+out_allowed:
+	*out_scanning_explicit_allowed = TRUE;
+	*out_scanning_periodic_allowed = TRUE;
+	return;
+}
+
+static void
+_scanning_allowed_maybe_changed (NMDeviceWifi *self)
+{
+	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
+	gboolean scanning_explicit_allowed;
+	gboolean scanning_periodic_allowed;
+
+	_scanning_get_allowed (self, &scanning_explicit_allowed, &scanning_periodic_allowed);
+
+	if (   priv->scanning_explicit_allowed == scanning_explicit_allowed
+	    && priv->scanning_periodic_allowed == scanning_periodic_allowed)
+		return;
+
+	priv->scanning_explicit_allowed = scanning_explicit_allowed;
+	priv->scanning_periodic_allowed = scanning_periodic_allowed;
+	_scanning_kick_off (self, FALSE, FALSE);
 }
 
 static gboolean
@@ -1452,66 +1574,96 @@ build_hidden_probe_list (NMDeviceWifi *self)
 }
 
 static void
-request_wireless_scan (NMDeviceWifi *self,
-                       gboolean periodic,
-                       gboolean force_if_scanning,
-                       const GPtrArray *ssids)
+_scanning_supplicant_request_scan (NMDeviceWifi *self)
 {
 	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
-	gboolean request_started = FALSE;
+	gs_unref_ptrarray GPtrArray *hidden_ssids = NULL;
+	gs_unref_ptrarray GPtrArray *ssids = NULL;
+	gboolean hidden_probe_scan_warn = FALSE;
+	gint64 now_msec;
+	guint i;
 
-	nm_clear_g_source (&priv->pending_scan_id);
+	hidden_ssids = build_hidden_probe_list (self);
+	if (hidden_ssids) {
+		if (priv->hidden_probe_scan_warn) {
+			priv->hidden_probe_scan_warn = FALSE;
+			hidden_probe_scan_warn = TRUE;
+		}
+	} else
+		priv->hidden_probe_scan_warn = TRUE;
 
-	if (!force_if_scanning && priv->requested_scan) {
-		/* There's already a scan in progress */
-		return;
+	now_msec = nm_utils_get_monotonic_timestamp_msec ();
+
+	ssids = _scan_request_ssids_fetch (priv, now_msec);
+	if (!ssids)
+		ssids = g_steal_pointer (&hidden_ssids);
+	else if (hidden_ssids) {
+		for (i = 0; i < hidden_ssids->len; i++)
+			g_ptr_array_add (ssids, g_bytes_ref (hidden_ssids->pdata[i]));
 	}
 
-	if (!check_scanning_prohibited (self, periodic)) {
-		gs_unref_ptrarray GPtrArray *hidden_ssids = NULL;
+	if (   ssids
+	    && ssids->len == 0)
+		nm_clear_pointer (&ssids, g_ptr_array_unref);
 
-		_LOGD (LOGD_WIFI, "wifi-scan: scanning requested");
-
-		if (!ssids) {
-			hidden_ssids = build_hidden_probe_list (self);
-			if (hidden_ssids) {
-				if (priv->hidden_probe_scan_warn) {
-					priv->hidden_probe_scan_warn = FALSE;
-					_LOGW (LOGD_WIFI, "wifi-scan: active scanning for networks due to profiles with wifi.hidden=yes. This makes you trackable");
-				}
-				ssids = hidden_ssids;
-			} else
-				priv->hidden_probe_scan_warn = TRUE;
-		}
-
+	if (!ssids)
+		_LOGD (LOGD_WIFI, "wifi-scan: scanning starting...");
+	else {
+		if (ssids->len > SCAN_REQUEST_SSIDS_MAX_NUM)
+			g_ptr_array_remove_range (ssids, SCAN_REQUEST_SSIDS_MAX_NUM, ssids->len - SCAN_REQUEST_SSIDS_MAX_NUM);
+		_LOGD (LOGD_WIFI, "wifi-scan: scanning starting (probe %u SSIDs)...", ssids->len);
+		if (hidden_probe_scan_warn)
+			_LOGW (LOGD_WIFI, "wifi-scan: active scanning for networks due to profiles with wifi.hidden=yes. This makes you trackable");
 		if (_LOGD_ENABLED (LOGD_WIFI)) {
-			if (ssids) {
-				guint i;
+			for (i = 0; i < ssids->len; i++) {
+				gs_free char *ssid_str = NULL;
+				GBytes *ssid = ssids->pdata[i];
 
-				for (i = 0; i < ssids->len; i++) {
-					gs_free char *ssid_str = NULL;
-					GBytes *ssid = ssids->pdata[i];
-
-					ssid_str = g_bytes_get_size (ssid) > 0
-					           ? _nm_utils_ssid_to_string (ssid)
-					           : NULL;
-					_LOGD (LOGD_WIFI, "wifi-scan: (%u) probe scanning SSID %s",
-					       i, ssid_str ?: "*any*");
-				}
-			} else
-				_LOGD (LOGD_WIFI, "wifi-scan: no SSIDs to probe scan");
+				ssid_str =   g_bytes_get_size (ssid) > 0
+				           ? _nm_utils_ssid_to_string (ssid)
+				           : NULL;
+				_LOGD (LOGD_WIFI, "wifi-scan: probe scanning SSID %s",
+				       ssid_str ?: "*any*");
+			}
 		}
+	}
 
-		_hw_addr_set_scanning (self, FALSE);
+	_hw_addr_set_scanning (self, FALSE);
 
-		nm_supplicant_interface_request_scan (priv->sup_iface,
-		                                      ssids ? (GBytes *const*) ssids->pdata : NULL,
-		                                      ssids ? ssids->len : 0u);
-		request_started = TRUE;
-	} else
-		_LOGD (LOGD_WIFI, "wifi-scan: scanning requested but not allowed at this time");
+	nm_supplicant_interface_request_scan (priv->sup_iface,
+	                                      ssids ? (GBytes *const*) ssids->pdata : NULL,
+	                                      ssids ? ssids->len : 0u);
+}
 
-	_requested_scan_set (self, request_started);
+static void
+_scanning_kick_off (NMDeviceWifi *self,
+                    gboolean is_periodic,
+                    gboolean requested)
+{
+	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
+
+	if (is_periodic) {
+		nm_assert (!requested);
+		if (!priv->scanning_periodic_allowed)
+			return;
+	} else {
+		if (!priv->scanning_explicit_allowed) {
+			if (requested)
+				priv->scan_request = TRUE;
+			if (priv->scan_request)
+				_requested_scan_set (self, TRUE);
+			return;
+		}
+		if (requested) {
+			/* pass */
+		} else if (!priv->scan_request)
+			return;
+	}
+
+	priv->scan_requested = FALSE;
+	_requested_scan_set (self, TRUE);
+
+	_scanning_supplicant_request_scan (self);
 
 	schedule_scan (self, request_started);
 }
@@ -1523,7 +1675,7 @@ request_wireless_scan_periodic (gpointer user_data)
 	NMDeviceWifiPrivate *priv = NM_DEVICE_WIFI_GET_PRIVATE (self);
 
 	priv->pending_scan_id = 0;
-	request_wireless_scan (self, TRUE, FALSE, NULL);
+	_scanning_kick_off (self, TRUE, FALSE);
 	return G_SOURCE_REMOVE;
 }
 
@@ -2225,17 +2377,19 @@ supplicant_iface_state (NMDeviceWifi *self,
 		/* we would clear _requested_scan_set() and trigger a new scan.
 		 * However, we don't want to cancel the current pending action, so force
 		 * a new scan request. */
-		request_wireless_scan (self, FALSE, TRUE, NULL);
+		_scanning_kick_off (self, FALSE, TRUE);
 		break;
 	default:
 		break;
 	}
 
 out:
-	_notify_scanning (self);
+	if (!_notify_scanning (self))
+		_scanning_allowed_maybe_changed (self);
 
 	if (old_state == NM_SUPPLICANT_INTERFACE_STATE_STARTING)
 		nm_device_remove_pending_action (device, NM_PENDING_ACTION_WAITING_FOR_SUPPLICANT, TRUE);
+
 }
 
 static void
@@ -3163,7 +3317,7 @@ device_state_changed (NMDevice *device,
 	case NM_DEVICE_STATE_DISCONNECTED:
 		/* Kick off a scan to get latest results */
 		priv->scan_interval_sec = SCAN_INTERVAL_SEC_MIN;
-		request_wireless_scan (self, FALSE, FALSE, NULL);
+		_scanning_kick_off (self, FALSE, TRUE);
 		break;
 	default:
 		break;
@@ -3171,6 +3325,8 @@ device_state_changed (NMDevice *device,
 
 	if (clear_aps)
 		remove_all_aps (self);
+
+	_scanning_allowed_maybe_changed (self);
 }
 
 static gboolean
@@ -3358,6 +3514,7 @@ nm_device_wifi_init (NMDeviceWifi *self)
 
 	c_list_init (&priv->aps_lst_head);
 	c_list_init (&priv->scanning_prohibited_lst_head);
+	c_list_init (&priv->scan_request_ssids_lst_head);
 	priv->aps_idx_by_supplicant_path = g_hash_table_new (nm_direct_hash, NULL);
 
 	priv->hidden_probe_scan_warn = TRUE;
